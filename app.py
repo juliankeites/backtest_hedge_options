@@ -25,16 +25,18 @@ def b76(F, K, T, s):
     d1 = (np.log(F/K) + .5*s*s*T) / (s*np.sqrt(T)); d2 = d1 - s*np.sqrt(T)
     return F*norm.cdf(d1) - K*norm.cdf(d2)
 
-def run(px, budget, otm, vol_mode, vol, annual, maxh, tmin, tmax, floor):
+def run_calls(px, budget, otm, vol_mode, vol, annual, maxh, tmin, tmax, floor, vrp, tcost):
     rv = np.log(px).diff().rolling(12, min_periods=6).std()*np.sqrt(12)
     tenors = list(range(tmin, tmax+1)); layer = maxh*(annual/12)/len(tenors)
     spent, out = {}, []
     for t in px.index:
-        v = vol if vol_mode == "Flat" else max(rv.get(t, np.nan) if not np.isnan(rv.get(t, np.nan)) else vol, floor)
+        r_ = rv.get(t, np.nan)
+        v = vol if vol_mode == "Flat" else (max(r_, floor) if not np.isnan(r_) else vol) + vrp
+        v = max(v, 0.05)
         for h in tenors:
             e = t + pd.DateOffset(months=h)
             if e not in px.index: continue
-            S = px[t]; K = S*(1+otm); p = b76(S, K, h/12, v)
+            S = px[t]; K = S*(1+otm); p = b76(S, K, h/12, v)*(1+tcost)
             used = spent.get(t.year, 0); q = layer
             if used + p*q > budget: q = max(0, (budget-used)/p)
             spent[t.year] = used + p*q
@@ -42,43 +44,101 @@ def run(px, budget, otm, vol_mode, vol, annual, maxh, tmin, tmax, floor):
                             bbl=q, premium=p*q, payout=max(px[e]-K, 0)*q))
     return pd.DataFrame(out)
 
-st.title("Jet fuel call-option hedge: what if we had hedged since 2020?")
+def run_swaps(px, annual, maxh, tmin, tmax):
+    tenors = list(range(tmin, tmax+1)); layer = maxh*(annual/12)/len(tenors)
+    out = []
+    for t in px.index:
+        for h in tenors:
+            e = t + pd.DateOffset(months=h)
+            if e not in px.index: continue
+            K = px[t]
+            out.append(dict(buy=t, expiry=e, tenor=h, strike=K, bbl=layer,
+                            settlement=max(px[e]-K, 0), payout=(px[e]-K)*layer))
+    return pd.DataFrame(out)
+
+def monthly_cost(px, d_calls, annual):
+    mc = annual/12
+    unhedged = (px*mc).rename("unhedged")
+    if d_calls is None or d_calls.empty:
+        hedged = unhedged.copy()
+    else:
+        pay = d_calls.groupby("expiry").apply(lambda g: (g.payout.sum()-g.premium.sum()), include_groups=False)
+        hedged = (unhedged + pay.reindex(unhedged.index).fillna(0)).rename("hedged")
+    return pd.concat([unhedged, hedged], axis=1).dropna()
+
+st.title("Jet fuel hedge: what protection would we have bought?")
+st.caption("Reframed for the Board: cost of insurance vs. cost of a spike, cash-flow smoothing, downside protection, and comparison to swaps. Spot-only backtest, flat curve, Black-76 pricing, monthly-average settlement. Indicative only.")
+
 with st.sidebar:
+    st.header("Programme")
     budget = st.number_input("Annual premium budget (USD m)", 0.5, 50.0, 5.0, 0.5)*1e6
     annual = st.number_input("Annual consumption (m bbl)", 0.5, 20.0, 3.5, 0.1)*1e6
     maxh = st.slider("Max hedge ratio", 0.05, 1.0, 0.40, 0.05)
     otm = st.slider("OTM strike (%)", 0, 20, 5)/100
     tmin, tmax = st.slider("Tenor range (months ahead)", 1, 12, (1, 6))
+    st.header("Volatility & costs")
     vol_mode = st.radio("Volatility", ["Flat", "Rolling realised (12m)"])
     vol = st.slider("Flat vol / fallback (%)", 15, 80, 35)/100
     floor = st.slider("Vol floor for realised (%)", 10, 50, 25)/100
+    vrp = st.slider("Implied-over-realised premium (vol pts)", -10, 20, 3)/100
+    tcost = st.slider("Transaction cost (% of premium)", 0.0, 10.0, 2.0, 0.5)/100
     up = st.file_uploader("Optional price CSV (date, USD/bbl)", type="csv")
+
 px = load_prices(up)
-d = run(px, budget, otm, vol_mode, vol, annual, maxh, tmin, tmax, floor)
+d = run_calls(px, budget, otm, vol_mode, vol, annual, maxh, tmin, tmax, floor, vrp, tcost)
 d["buy_yr"] = d.buy.dt.year; d["net"] = d.payout - d.premium
+sw = run_swaps(px, annual, maxh, tmin, tmax)
+mc = annual/12
+unh = (px*mc)
+cost = monthly_cost(px, d, annual)
 
-c = st.columns(5)
-c[0].metric("Premium spent", f"${d.premium.sum()/1e6:.1f}m")
-c[1].metric("Payout", f"${d.payout.sum()/1e6:.1f}m")
-c[2].metric("Net P&L", f"${d.net.sum()/1e6:.1f}m")
-c[3].metric("Barrels hedged", f"{d.bbl.sum()/1e6:.2f}m")
-c[4].metric("Avg premium", f"${d.premium.sum()/d.bbl.sum():.2f}/bbl")
+st.header("1. Cost of insurance vs. cost of a spike")
+worst_m = unh.idxmax()
+call_pay_that_m = d[d.expiry == worst_m].payout.sum() - d[d.expiry == worst_m].premium.sum()
+swap_pay_that_m = sw[sw.expiry == worst_m].payout.sum()
+c = st.columns(4)
+c[0].metric("Total premium (6y)", f"${d.premium.sum()/1e6:.1f}m")
+c[1].metric("Worst month unhedged", f"${unh.max()/1e6:.1f}m", f"{worst_m:%b %Y}")
+c[2].metric("Calls offset in that month", f"${call_pay_that_m/1e6:.1f}m")
+c[3].metric("Swaps offset in that month", f"${swap_pay_that_m/1e6:.1f}m")
+st.caption(f"In the worst single month ({worst_m:%b %Y}), unhedged fuel cost was ${unh.max()/1e6:.1f}m. "
+           f"The call programme offset ${call_pay_that_m/1e6:.1f}m of that; a swap programme at the same volume would have offset ${swap_pay_that_m/1e6:.1f}m.")
 
-by = d.groupby("buy_yr").agg(premium=("premium", "sum"), payout=("payout", "sum"), net=("net", "sum"), bbl=("bbl", "sum"))
+st.header("2. Cash-flow smoothing: monthly fuel cost")
+st.caption("Unhedged = spot x monthly consumption. Hedged = unhedged + net option P&L settled that month.")
 l, r = st.columns(2)
-l.subheader("Net result by purchase year (USD)"); l.bar_chart(by[["premium", "payout", "net"]])
-r.subheader("Spot price (USD/bbl)"); r.line_chart(px)
-st.subheader("Cumulative net P&L by expiry (USD m)")
-cum = d.groupby("expiry").net.sum().cumsum()/1e6; st.line_chart(cum)
-st.subheader("Annual summary"); st.dataframe(by.round(0))
+l.line_chart(cost)
+r.bar_chart(cost.diff().abs().mean().rename("avg abs monthly change (USD)"))
+st.dataframe(cost.describe().round(0))
 
-st.subheader("Volatility sensitivity")
-rows = []
-for v in (.25, .35, .45):
-    x = run(px, budget, otm, "Flat", v, annual, maxh, tmin, tmax, floor)
-    rows.append(dict(vol=v, premium_m=x.premium.sum()/1e6, payout_m=x.payout.sum()/1e6,
-                     net_m=(x.payout.sum()-x.premium.sum())/1e6, avg_prem_bbl=x.premium.sum()/x.bbl.sum()))
-st.dataframe(pd.DataFrame(rows).round(2))
-with st.expander("Layer detail"):
-    st.dataframe(d); st.download_button("Download CSV", d.to_csv(index=False), "layers.csv")
-st.caption("Spot-only backtest: flat curve (forward = spot), Black-76 premium, settled on monthly average spot. Indicative only. Data: EIA USGC jet to Sep 2025.")
+st.header("3. Downside protection: 95th percentile of monthly cost")
+p95u, p95h = cost.unhedged.quantile(.95), cost.hedged.quantile(.95)
+c = st.columns(3)
+c[0].metric("Unhedged P95 monthly cost", f"${p95u/1e6:.1f}m")
+c[1].metric("Hedged (calls) P95", f"${p95h/1e6:.1f}m", f"-${(p95u-p95h)/1e6:.1f}m")
+c[2].metric("Reduction", f"{(1-p95h/p95u)*100:.0f}%")
+st.caption(f"The 95th percentile of monthly fuel cost falls from ${p95u/1e6:.1f}m to ${p95h/1e6:.1f}m with the call programme. "
+           f"That ${((p95u-p95h)/1e6):.1f}m reduction in tail cost is what the ${d.premium.sum()/1e6:.1f}m premium bought.")
+
+st.header("4. Comparison: calls vs. swaps vs. no hedge")
+sw_net = sw.payout.sum()
+rows = [dict(strategy="No hedge", premium=0, payout=0, net=0, tail_p95=p95u),
+        dict(strategy="Call options", premium=d.premium.sum(), payout=d.payout.sum(),
+             net=d.net.sum(), tail_p95=p95h)]
+sw_hedged = unh + sw.groupby("expiry").payout.sum().reindex(unh.index).fillna(0)
+rows.append(dict(strategy="Swaps (same volume)", premium=0, payout=sw_net, net=sw_net,
+                 tail_p95=sw_hedged.quantile(.95)))
+cmp = pd.DataFrame(rows)
+cmp["premium_m"] = cmp.premium/1e6; cmp["payout_m"] = cmp.payout/1e6
+cmp["net_m"] = cmp.net/1e6; cmp["tail_p95_m"] = cmp.tail_p95/1e6
+st.dataframe(cmp[["strategy", "premium_m", "payout_m", "net_m", "tail_p95_m"]].round(2))
+st.caption("Swaps lock in the forward price (here, spot) with no premium but full downside if prices fall. "
+           "Calls cost premium but preserve upside. Tail P95 is the 95th percentile of monthly fuel cost.")
+
+st.header("Appendix: detail")
+with st.expander("Call option layers"):
+    st.dataframe(d); st.download_button("Download calls CSV", d.to_csv(index=False), "calls.csv")
+with st.expander("Swap layers"):
+    st.dataframe(sw); st.download_button("Download swaps CSV", sw.to_csv(index=False), "swaps.csv")
+st.caption("Data: EIA USGC jet to Sep 2025 unless a CSV is uploaded. Flat curve (forward = spot). "
+           "Transaction costs applied to option premium. Swap strike = spot at purchase (flat curve proxy).")
