@@ -81,4 +81,4 @@ for v in (.25, .35, .45):
 st.dataframe(pd.DataFrame(rows).round(2))
 with st.expander("Layer detail"):
     st.dataframe(d); st.download_button("Download CSV", d.to_csv(index=False), "layers.csv")
-st.caption("Spot-only backtest: flat curve (forward = spot), Black-76 premium, settled on monthly average spot. Indicative only. Data: EIA USGC jet to Sep 2025."
+st.caption("Spot-only backtest: flat curve (forward = spot), Black-76 premium, settled on monthly average spot. Indicative only. Data: EIA USGC jet to Sep 2025.")
