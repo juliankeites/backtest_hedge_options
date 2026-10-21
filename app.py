@@ -61,10 +61,12 @@ def monthly_cost(px, d_calls, annual):
     unhedged = (px*mc).rename("unhedged")
     if d_calls is None or d_calls.empty:
         hedged = unhedged.copy()
+        prem_out = pd.Series(0.0, index=unhedged.index); pay_in = pd.Series(0.0, index=unhedged.index)
     else:
-        pay = d_calls.groupby("expiry").apply(lambda g: (g.payout.sum()-g.premium.sum()), include_groups=False)
-        hedged = (unhedged + pay.reindex(unhedged.index).fillna(0)).rename("hedged")
-    return pd.concat([unhedged, hedged], axis=1).dropna()
+        prem_out = d_calls.groupby("buy").premium.sum().reindex(unhedged.index).fillna(0)
+        pay_in = d_calls.groupby("expiry").payout.sum().reindex(unhedged.index).fillna(0)
+        hedged = (unhedged + prem_out - pay_in).rename("hedged")
+    return pd.concat([unhedged, hedged, prem_out.rename("premium_cash_out"), pay_in.rename("payout_cash_in")], axis=1).dropna()
 
 st.title("Jet fuel hedge: what protection would we have bought?")
 st.caption("Reframed for the Board: cost of insurance vs. cost of a spike, cash-flow smoothing, downside protection, and comparison to swaps. Spot-only backtest, flat curve, Black-76 pricing, monthly-average settlement. Indicative only.")
@@ -91,6 +93,7 @@ sw = run_swaps(px, annual, maxh, tmin, tmax)
 mc = annual/12
 unh = (px*mc)
 cost = monthly_cost(px, d, annual)
+benefit = (cost.unhedged - cost.hedged).rename("hedge benefit (USD m)")  # positive = hedge saved money
 
 st.header("1. Cost of insurance vs. cost of a spike")
 worst_m = unh.idxmax()
@@ -104,12 +107,13 @@ c[3].metric("Swaps offset in that month", f"${swap_pay_that_m/1e6:.1f}m")
 st.caption(f"In the worst single month ({worst_m:%b %Y}), unhedged fuel cost was ${unh.max()/1e6:.1f}m. "
            f"The call programme offset ${call_pay_that_m/1e6:.1f}m of that; a swap programme at the same volume would have offset ${swap_pay_that_m/1e6:.1f}m.")
 
-st.header("2. Cash-flow smoothing: monthly fuel cost")
-st.caption("Unhedged = spot x monthly consumption. Hedged = unhedged + net option P&L settled that month.")
+st.header("2. Cash-flow smoothing: monthly fuel cost (cash basis)")
+st.caption("Unhedged = spot x monthly consumption. Hedged = unhedged + premium cash OUT in the purchase month - payout cash IN in the expiry month. This reflects actual cash timing, not accrual. Because the hedge effect is small relative to the total fuel bill, the two lines overlap; use the benefit chart below to see the hedge effect clearly.")
 l, r = st.columns(2)
-l.line_chart(cost)
-r.bar_chart(cost.diff().abs().mean().rename("avg abs monthly change (USD)"))
-st.dataframe(cost.describe().round(0))
+l.line_chart(cost[["unhedged", "hedged"]])
+r.line_chart(benefit/1e6)
+st.caption("Right chart: hedge benefit per month, USD m. Positive = hedge reduced that month's cash cost; negative = premium outflow exceeded payout inflow that month.")
+st.dataframe(cost[["unhedged", "hedged", "premium_cash_out", "payout_cash_in"]].describe().round(0))
 
 st.header("3. Downside protection: 95th percentile of monthly cost")
 p95u, p95h = cost.unhedged.quantile(.95), cost.hedged.quantile(.95)
@@ -122,18 +126,29 @@ st.caption(f"The 95th percentile of monthly fuel cost falls from ${p95u/1e6:.1f}
 
 st.header("4. Comparison: calls vs. swaps vs. no hedge")
 sw_net = sw.payout.sum()
+sw_hedged = unh + sw.groupby("expiry").payout.sum().reindex(unh.index).fillna(0)
 rows = [dict(strategy="No hedge", premium=0, payout=0, net=0, tail_p95=p95u),
         dict(strategy="Call options", premium=d.premium.sum(), payout=d.payout.sum(),
-             net=d.net.sum(), tail_p95=p95h)]
-sw_hedged = unh + sw.groupby("expiry").payout.sum().reindex(unh.index).fillna(0)
-rows.append(dict(strategy="Swaps (same volume)", premium=0, payout=sw_net, net=sw_net,
-                 tail_p95=sw_hedged.quantile(.95)))
+             net=d.net.sum(), tail_p95=p95h),
+        dict(strategy="Swaps (same volume)", premium=0, payout=sw_net, net=sw_net,
+             tail_p95=sw_hedged.quantile(.95))]
 cmp = pd.DataFrame(rows)
 cmp["premium_m"] = cmp.premium/1e6; cmp["payout_m"] = cmp.payout/1e6
 cmp["net_m"] = cmp.net/1e6; cmp["tail_p95_m"] = cmp.tail_p95/1e6
 st.dataframe(cmp[["strategy", "premium_m", "payout_m", "net_m", "tail_p95_m"]].round(2))
 st.caption("Swaps lock in the forward price (here, spot) with no premium but full downside if prices fall. "
            "Calls cost premium but preserve upside. Tail P95 is the 95th percentile of monthly fuel cost.")
+
+st.header("5. Cash timing: when cash actually moves")
+cash = cost[["premium_cash_out", "payout_cash_in"]].copy()
+cash["net_cash"] = cash.payout_cash_in - cash.premium_cash_out
+cash["cum_net_cash"] = cash.net_cash.cumsum()
+l2, r2 = st.columns(2)
+l2.bar_chart(cash[["premium_cash_out", "payout_cash_in"]]/1e6)
+r2.line_chart(cash.cum_net_cash/1e6)
+st.caption("Left: monthly premium cash outflow (at purchase) vs payout cash inflow (at expiry), USD m. "
+           "Right: cumulative net cash from the hedge programme, USD m. Negative cumulative cash means the programme has been a net cash drain to date; the trough shows the maximum cash committed before payouts caught up.")
+st.dataframe(cash.round(0))
 
 st.header("Appendix: detail")
 with st.expander("Call option layers"):
